@@ -7,38 +7,61 @@ import urllib3
 
 from fetcher import fetch_urban_vpn_proxies
 
+
+# ============================================================
+# CONFIG
+# ============================================================
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
-
-# --------------------------------------------------
-# CONFIG
-# --------------------------------------------------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROXY_FILE = os.path.join(BASE_DIR, "proxies.txt")
 
 REFRESH_INTERVAL = 120  # 2 minutes
 
-# --------------------------------------------------
-# STATE
-# --------------------------------------------------
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
 
 last_update = "Never"
 proxy_count = 0
 is_fetching = False
 
-# Prevent multiple fetches from running simultaneously
+# Prevent two fetch operations from running simultaneously
 fetch_lock = threading.Lock()
 
-# --------------------------------------------------
-# PROXY FILE
-# --------------------------------------------------
+# Prevent the updater from accidentally being started twice
+updater_start_lock = threading.Lock()
+updater_started = False
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def log(message):
+    """Print immediately so Railway captures the log."""
+    print(
+        f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] "
+        f"{message}",
+        flush=True
+    )
+
+
+# ============================================================
+# SAVE PROXIES
+# ============================================================
 
 def save_proxies(proxies):
     """
-    Save proxies atomically so /proxies.txt never
-    serves a partially-written file.
+    Save the proxy list atomically.
+
+    The new file is written completely first and then replaces
+    the existing proxies.txt. This prevents clients from
+    downloading a partially-written file.
     """
 
     global proxy_count, last_update
@@ -47,79 +70,119 @@ def save_proxies(proxies):
 
     with open(temp_file, "w", encoding="utf-8") as f:
         for proxy in proxies:
-            f.write(
-                f"{proxy['ip']}:{proxy['port']}:{proxy['user']}:{proxy['pass']}\n"
-            )
+            try:
+                ip = proxy["ip"]
+                port = proxy["port"]
+                user = proxy["user"]
+                password = proxy["pass"]
 
-    # Replace old file only after the new file is
-    # completely written.
+                f.write(
+                    f"{ip}:{port}:{user}:{password}\n"
+                )
+
+            except KeyError as e:
+                log(f"[!] Invalid proxy entry, missing key: {e}")
+
+    # Atomically replace the old file
     os.replace(temp_file, PROXY_FILE)
 
     proxy_count = len(proxies)
+
     last_update = datetime.utcnow().strftime(
         "%Y-%m-%d %H:%M:%S UTC"
     )
 
 
-# --------------------------------------------------
-# FETCH
-# --------------------------------------------------
+# ============================================================
+# ONE PROXY FETCH
+# ============================================================
 
 def fetch_once():
     """
-    Perform one complete proxy fetch.
+    Perform one proxy fetch.
+
+    Returns:
+        True  = successful fetch
+        False = failed/no proxies
     """
 
     global is_fetching
 
-    # Don't allow two fetches at the same time
+    # Don't allow another fetch while one is running
     if not fetch_lock.acquire(blocking=False):
-        print("[!] Proxy fetch already running.")
+        log("[!] Proxy fetch already running. Skipping.")
         return False
 
     is_fetching = True
+
     start_time = time.time()
 
     try:
-        print("[*] Fetching fresh proxies...")
+        log("=" * 60)
+        log("[*] Starting proxy fetch...")
+        log("[*] Calling Urban VPN fetcher...")
 
         proxies = fetch_urban_vpn_proxies()
 
+        elapsed = time.time() - start_time
+
         if not proxies:
-            print("[-] No proxies fetched.")
+            log(
+                f"[-] Fetch completed but returned 0 proxies "
+                f"after {elapsed:.2f}s"
+            )
+
             return False
 
         save_proxies(proxies)
 
-        elapsed = time.time() - start_time
-
-        print(
-            f"[+] Updated {len(proxies)} proxies "
+        log(
+            f"[+] Successfully fetched {len(proxies)} proxies "
             f"in {elapsed:.2f}s"
         )
+
+        log(f"[+] Proxy file: {PROXY_FILE}")
+        log(f"[+] Proxy count: {proxy_count}")
+        log(f"[+] Last update: {last_update}")
 
         return True
 
     except Exception as e:
-        print(f"[!] Proxy update failed: {e}")
+
+        elapsed = time.time() - start_time
+
+        log(
+            f"[!] Proxy fetch failed after {elapsed:.2f}s: "
+            f"{type(e).__name__}: {e}"
+        )
+
         return False
 
     finally:
+
         is_fetching = False
-        fetch_lock.release()
+
+        try:
+            fetch_lock.release()
+        except RuntimeError:
+            pass
 
 
-# --------------------------------------------------
-# AUTOMATIC FETCHER
-# --------------------------------------------------
+# ============================================================
+# AUTOMATIC PROXY UPDATER
+# ============================================================
 
 def update_proxies():
     """
-    Automatically fetch proxies immediately on startup,
-    then refresh every 120 seconds.
+    Run the initial fetch immediately and then refresh
+    every 120 seconds.
     """
 
-    print("[*] Automatic proxy updater started.")
+    log("[+] Automatic proxy updater started.")
+    log(
+        f"[*] Refresh interval: "
+        f"{REFRESH_INTERVAL} seconds"
+    )
 
     while True:
 
@@ -127,21 +190,57 @@ def update_proxies():
             fetch_once()
 
         except Exception as e:
-            # Extra protection so the updater thread
-            # never dies permanently.
-            print(f"[!] Updater thread error: {e}")
+            # Make absolutely sure the background thread
+            # doesn't permanently die.
+            log(
+                f"[!] Unexpected updater error: "
+                f"{type(e).__name__}: {e}"
+            )
 
-        print(
-            f"[*] Next proxy refresh in "
-            f"{REFRESH_INTERVAL} seconds."
+        log(
+            f"[*] Waiting {REFRESH_INTERVAL} seconds "
+            f"until next refresh..."
         )
 
         time.sleep(REFRESH_INTERVAL)
 
 
-# --------------------------------------------------
-# API ROUTES
-# --------------------------------------------------
+# ============================================================
+# START UPDATER
+# ============================================================
+
+def start_updater():
+    """
+    Start the background updater exactly once.
+
+    IMPORTANT:
+    This is called when app.py is imported by Gunicorn.
+    """
+
+    global updater_started
+
+    with updater_start_lock:
+
+        if updater_started:
+            log("[*] Proxy updater already started.")
+            return
+
+        updater_started = True
+
+        thread = threading.Thread(
+            target=update_proxies,
+            daemon=True,
+            name="proxy-updater"
+        )
+
+        thread.start()
+
+        log("[+] Proxy updater thread launched.")
+
+
+# ============================================================
+# HOME
+# ============================================================
 
 @app.route("/")
 def home():
@@ -152,9 +251,15 @@ def home():
         "last_update": last_update,
         "refresh_interval": f"{REFRESH_INTERVAL} seconds",
         "fetching": is_fetching,
-        "download": "/proxies.txt"
+        "proxy_file_exists": os.path.exists(PROXY_FILE),
+        "download": "/proxies.txt",
+        "manual_refresh": "/refresh"
     })
 
+
+# ============================================================
+# PROXY FILE
+# ============================================================
 
 @app.route("/proxies.txt")
 def proxies():
@@ -163,16 +268,24 @@ def proxies():
 
         return (
             "Proxy list is being generated...",
-            503
+            503,
+            {
+                "Cache-Control": "no-cache"
+            }
         )
 
     return send_file(
         PROXY_FILE,
         mimetype="text/plain",
         as_attachment=False,
-        download_name="proxies.txt"
+        download_name="proxies.txt",
+        max_age=0
     )
 
+
+# ============================================================
+# MANUAL REFRESH
+# ============================================================
 
 @app.route("/refresh")
 def refresh():
@@ -180,74 +293,67 @@ def refresh():
     if is_fetching:
 
         return jsonify({
+            "status": "already_fetching",
             "message": "A proxy refresh is already running.",
             "fetching": True
         }), 409
 
-    threading.Thread(
+    log("[*] Manual refresh requested.")
+
+    thread = threading.Thread(
         target=fetch_once,
-        daemon=True
-    ).start()
+        daemon=True,
+        name="manual-proxy-refresh"
+    )
+
+    thread.start()
 
     return jsonify({
-        "message": "Manual refresh started",
+        "status": "started",
+        "message": "Manual proxy refresh started.",
         "fetching": True
     })
 
 
-# --------------------------------------------------
-# START BACKGROUND FETCHER
-# --------------------------------------------------
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.route("/health")
+def health():
+
+    return jsonify({
+        "status": "healthy",
+        "proxy_file_exists": os.path.exists(PROXY_FILE),
+        "proxy_count": proxy_count,
+        "fetching": is_fetching,
+        "last_update": last_update
+    })
+
+
+# ============================================================
+# START BACKGROUND THREAD
+# ============================================================
 #
-# IMPORTANT:
-#
-# This is intentionally OUTSIDE:
+# DO NOT put this inside:
 #
 #     if __name__ == "__main__":
 #
-# Railway uses Gunicorn:
+# Railway runs:
 #
 #     gunicorn app:app
 #
-# Therefore __name__ is NOT "__main__".
+# which imports this file rather than executing it as
+# "__main__".
 #
-# Putting the updater here ensures it starts when
-# Gunicorn imports this module.
-#
-# --------------------------------------------------
-
-_updater_started = False
-_updater_start_lock = threading.Lock()
-
-
-def start_updater():
-
-    global _updater_started
-
-    with _updater_start_lock:
-
-        if _updater_started:
-            return
-
-        _updater_started = True
-
-        updater_thread = threading.Thread(
-            target=update_proxies,
-            daemon=True,
-            name="proxy-updater"
-        )
-
-        updater_thread.start()
-
-        print("[+] Proxy updater thread started.")
-
+# ============================================================
 
 start_updater()
 
 
-# --------------------------------------------------
+# ============================================================
 # LOCAL DEVELOPMENT
-# --------------------------------------------------
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -255,8 +361,8 @@ if __name__ == "__main__":
         os.environ.get("PORT", 8080)
     )
 
-    print(
-        f"[*] Starting Flask server "
+    log(
+        f"[*] Starting Flask development server "
         f"on 0.0.0.0:{port}"
     )
 
