@@ -16,7 +16,7 @@ app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROXY_FILE = os.path.join(BASE_DIR, "proxies.txt")
 
-REFRESH_INTERVAL = 240
+REFRESH_INTERVAL = 300
 
 last_update = "Never"
 proxy_count = 0
