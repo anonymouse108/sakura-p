@@ -145,7 +145,7 @@ def home():
         "status": "online",
         "proxy_count": proxy_count,
         "last_update": last_update,
-        "refresh_interval": "120 seconds",
+        "refresh_interval": "300 seconds",
         "fetching": is_fetching,
         "proxy_file_exists": os.path.exists(PROXY_FILE),
         "download": "/proxies.txt",
